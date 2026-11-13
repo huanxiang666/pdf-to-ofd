@@ -1,9 +1,12 @@
-// pdf-to-ofd — PDF 转图片型 OFD 工具
+// pdf-to-ofd — PDF 与 图片型 OFD 双向转换工具
 // 用法:
-//   pdf-to-ofd                转换当前目录所有 PDF
-//   pdf-to-ofd <目录>         转换指定目录（支持把文件夹拖到程序上）
-//   pdf-to-ofd -r <目录>      递归子目录
-// 每个 PDF 转出同名 .ofd，每一页是一张 JPEG 图片，不做 OCR、不编辑内容。
+//
+//	pdf-to-ofd                转换当前目录所有 PDF / OFD
+//	pdf-to-ofd <目录>         转换指定目录（支持把文件夹拖到程序上）
+//	pdf-to-ofd -r <目录>      递归子目录
+//
+// PDF -> OFD: 每一页渲染成一张 JPEG 打包进 OFD，不做 OCR、不编辑内容。
+// OFD -> PDF: 提取页面图片按版式摆进 PDF（仅图片型内容，文字/矢量对象跳过并提示）。
 package main
 
 import (
@@ -246,7 +249,7 @@ func (b *ofdBuilder) pageContentXML(pageIdx int) string {
 
 // ======================= 主流程 =======================
 
-func convertOne(pdfPath, outPath string, dpi, quality int) (pages int, sizeMB float64, err error) {
+func convertPDF2OFD(pdfPath, outPath string, dpi, quality int) (pages int, sizeMB float64, err error) {
 	data, err := os.ReadFile(pdfPath)
 	if err != nil {
 		return 0, 0, err
@@ -298,20 +301,281 @@ func convertOne(pdfPath, outPath string, dpi, quality int) (pages int, sizeMB fl
 	return n, float64(st.Size()) / 1024 / 1024, nil
 }
 
+type batchOpts struct {
+	recursive bool
+	dpi       int
+	quality   int
+	outDir    string
+	force     bool
+}
+
+// batchPathKey 解析已有祖先的符号链接，也适用于尚未创建的输出路径。
+func batchPathKey(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	var tail []string
+	for {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			if runtime.GOOS == "windows" {
+				resolved = strings.ToLower(resolved)
+			}
+			return resolved, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", err
+		}
+		tail = append(tail, filepath.Base(path))
+		path = parent
+	}
+}
+
+// batchConvertFile 只在转换成功后提交输出，失败时仅清理自己的临时文件。
+func batchConvertFile(outPath string, convert func(string) error) error {
+	f, err := os.CreateTemp(filepath.Dir(outPath), ".pdf-to-ofd-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := convert(tmp); err != nil {
+		return err
+	}
+	return os.Rename(tmp, outPath)
+}
+
+// runBatch 扫描目录并双向转换, 日志通过 logf 输出 (CLI 打印到控制台, GUI 显示在窗口里)
+func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (okCount, failCount int) {
+	t0 := time.Now()
+	absDir = filepath.Clean(absDir)
+	type task struct {
+		src, rel, out, key string
+		info               os.FileInfo
+		pdf                bool
+		err                error
+	}
+	var tasks []task
+	// 扫描不完整时不能保证输入集合完整，因此在任何写入之前终止整批。
+	err := filepath.WalkDir(absDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if !o.recursive && path != absDir {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext != ".pdf" && ext != ".ofd" {
+			return nil
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("不是普通输入文件: %s", path)
+		}
+		key, err := batchPathKey(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(absDir, path)
+		if err != nil {
+			return err
+		}
+		tasks = append(tasks, task{src: path, rel: rel, key: key, info: info, pdf: ext == ".pdf"})
+		return nil
+	})
+	if err != nil {
+		logf("[错误] 扫描失败，未执行转换: %v", err)
+		return 0, 1
+	}
+	if len(tasks) == 0 {
+		logf("[完成] 该目录下没有 PDF / OFD 文件")
+		return 0, 0
+	}
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].pdf != tasks[j].pdf {
+			return tasks[i].pdf
+		}
+		return tasks[i].src < tasks[j].src
+	})
+	inputs := make(map[string]string, len(tasks))
+	for _, t := range tasks {
+		inputs[t.key] = t.src
+	}
+	// 路径键保护大小写/符号链接别名；SameFile 额外保护硬链接输入。
+	checkOutput := func(out string) (string, error) {
+		key, err := batchPathKey(out)
+		if err != nil {
+			return "", err
+		}
+		if src, exists := inputs[key]; exists {
+			return key, fmt.Errorf("输出与输入冲突，禁止覆盖: %s", src)
+		}
+		info, err := os.Stat(out)
+		if err != nil && !os.IsNotExist(err) {
+			return key, err
+		}
+		if err == nil {
+			for _, t := range tasks {
+				if os.SameFile(info, t.info) {
+					return key, fmt.Errorf("输出与输入冲突，禁止覆盖: %s", t.src)
+				}
+			}
+		}
+		return key, nil
+	}
+	outputs := make(map[string]int, len(tasks))
+	for i := range tasks {
+		t := &tasks[i]
+		ext := ".pdf"
+		if t.pdf {
+			ext = ".ofd"
+		}
+		base := t.src
+		if o.outDir != "" {
+			base = filepath.Join(o.outDir, t.rel)
+		}
+		t.out = strings.TrimSuffix(base, filepath.Ext(base)) + ext
+		key, err := checkOutput(t.out)
+		t.err = err
+		if key == "" {
+			continue
+		}
+		if j, exists := outputs[key]; exists {
+			conflict := fmt.Errorf("多个输入指向同一输出: %s", t.out)
+			t.err, tasks[j].err = conflict, conflict
+		} else {
+			outputs[key] = i
+		}
+	}
+
+	var pdfiumAttempted, pdfiumLoaded bool
+	var pdfiumErr error
+	defer func() {
+		if pdfiumLoaded {
+			fnDestroyLib()
+		}
+	}()
+	for i, t := range tasks {
+		if t.err != nil {
+			logf("[%d/%d] 失败: %s: %v", i+1, len(tasks), t.rel, t.err)
+			failCount++
+			continue
+		}
+		st, err := os.Lstat(t.out)
+		if err != nil && !os.IsNotExist(err) {
+			logf("[%d/%d] 失败: %s: %v", i+1, len(tasks), t.rel, err)
+			failCount++
+			continue
+		}
+		if err == nil && !st.Mode().IsRegular() {
+			logf("[%d/%d] 失败: 输出不是普通文件: %s", i+1, len(tasks), t.out)
+			failCount++
+			continue
+		}
+		if err == nil && !o.force {
+			logf("[%d/%d] 跳过(已存在): %s", i+1, len(tasks), t.rel)
+			okCount++
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(t.out), 0o755); err != nil {
+			logf("[%d/%d] 失败: 创建输出目录: %v", i+1, len(tasks), err)
+			failCount++
+			continue
+		}
+		logf("[%d/%d] 转换中: %s ...", i+1, len(tasks), t.rel)
+		var pages, skipped int
+		var sizeMB float64
+		err = batchConvertFile(t.out, func(tmp string) error {
+			var err error
+			if t.pdf {
+				// 直到输出检查通过、临时文件可创建后，才需要 PDFium。
+				if !pdfiumAttempted {
+					pdfiumAttempted = true
+					pdfiumErr = loadPdfium()
+					pdfiumLoaded = pdfiumErr == nil
+				}
+				if pdfiumErr != nil {
+					return pdfiumErr
+				}
+				pages, sizeMB, err = convertPDF2OFD(t.src, tmp, o.dpi, o.quality)
+			} else {
+				pages, skipped, sizeMB, err = convertOFD2PDF(t.src, tmp, o.dpi, o.quality)
+			}
+			if err != nil {
+				return err
+			}
+			// 提交前重新检查，避免转换期间出现的输入别名或旧输出被覆盖。
+			if _, err := checkOutput(t.out); err != nil {
+				return err
+			}
+			if !o.force {
+				if _, err := os.Lstat(t.out); err == nil {
+					return fmt.Errorf("输出已出现，未覆盖: %s", t.out)
+				} else if !os.IsNotExist(err) {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			logf("    失败: %v", err)
+			failCount++
+			continue
+		}
+		extra := ""
+		if skipped > 0 {
+			extra = fmt.Sprintf(" (跳过 %d 个文字/矢量对象)", skipped)
+		}
+		logf("    完成  %d 页, %.1f MB -> %s%s", pages, sizeMB, t.out, extra)
+		okCount++
+	}
+
+	logf("--------------------------------------------------")
+	logf("===== 汇总: 成功 %d, 失败 %d, 总耗时 %.1f 秒 =====", okCount, failCount, time.Since(t0).Seconds())
+	return okCount, failCount
+}
+
 func main() {
+	// 双击(无任何参数) -> GUI; 带参数 -> 命令行
+	if len(os.Args) == 1 && guiAvailable() {
+		runGUI()
+		return
+	}
+	waitEnter := ensureConsole()
+
 	var (
 		recursive = flag.Bool("r", false, "递归子目录")
 		dpi       = flag.Int("dpi", 150, "渲染 DPI (默认150)")
 		quality   = flag.Int("q", 85, "JPEG 质量 1-100 (默认85)")
-		outDir    = flag.String("o", "", "输出目录 (默认与 PDF 同目录)")
-		force     = flag.Bool("f", false, "覆盖已存在的 ofd")
+		outDir    = flag.String("o", "", "输出目录 (默认与源文件同目录)")
+		force     = flag.Bool("f", false, "覆盖已存在的输出文件")
 	)
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "pdf-to-ofd — PDF 转图片型 OFD (每页一张图, 不 OCR, 不编辑)")
+		fmt.Fprintln(os.Stderr, "pdf-to-ofd — PDF <-> 图片型 OFD 双向转换")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "用法:")
-		fmt.Fprintln(os.Stderr, "  pdf-to-ofd                转换当前目录所有 PDF")
-		fmt.Fprintln(os.Stderr, "  pdf-to-ofd <目录>         转换指定目录 (可把文件夹拖到程序上)")
+		fmt.Fprintln(os.Stderr, "  pdf-to-ofd                双击打开图形界面")
+		fmt.Fprintln(os.Stderr, "  pdf-to-ofd <目录>         命令行转换指定目录 (可把文件夹拖到程序上)")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "方向按扩展名自动识别: xx.pdf -> xx.ofd,  xx.ofd -> xx.pdf")
+		fmt.Fprintln(os.Stderr, "注: OFD->PDF 仅还原图片型内容, 文字/矢量对象会跳过并提示")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "选项:")
 		flag.PrintDefaults()
@@ -335,65 +599,20 @@ func main() {
 	fmt.Printf("参数: DPI=%d  JPEG质量=%d\n", *dpi, *quality)
 	fmt.Println("--------------------------------------------------")
 
-	if err := loadPdfium(); err != nil {
-		fmt.Printf("[错误] %v\n", err)
-		fmt.Println("提示: Windows 用户请把 pdfium.dll 放到本程序同目录")
-		os.Exit(1)
-	}
-	defer fnDestroyLib()
-
-	var pdfs []string
-	_ = filepath.WalkDir(absDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if !*recursive && path != absDir {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.ToLower(filepath.Ext(path)) == ".pdf" {
-			pdfs = append(pdfs, path)
-		}
-		return nil
+	_, failCount := runBatch(absDir, batchOpts{
+		recursive: *recursive,
+		dpi:       *dpi,
+		quality:   *quality,
+		outDir:    *outDir,
+		force:     *force,
+	}, func(format string, args ...interface{}) {
+		fmt.Printf(format+"\n", args...)
 	})
-	sort.Strings(pdfs)
 
-	if len(pdfs) == 0 {
-		fmt.Println("[完成] 该目录下没有 PDF 文件")
-		return
+	if waitEnter {
+		fmt.Print("按回车键退出...")
+		fmt.Scanln()
 	}
-
-	okCount, failCount := 0, 0
-	t0 := time.Now()
-	for i, pdfPath := range pdfs {
-		rel, _ := filepath.Rel(absDir, pdfPath)
-		outPath := strings.TrimSuffix(pdfPath, filepath.Ext(pdfPath)) + ".ofd"
-		if *outDir != "" {
-			os.MkdirAll(*outDir, 0o755)
-			outPath = filepath.Join(*outDir, strings.TrimSuffix(filepath.Base(pdfPath), filepath.Ext(pdfPath))+".ofd")
-		}
-		if !*force {
-			if _, err := os.Stat(outPath); err == nil {
-				fmt.Printf("[%d/%d] 跳过(已存在): %s\n", i+1, len(pdfs), rel)
-				okCount++
-				continue
-			}
-		}
-		fmt.Printf("[%d/%d] 转换中: %s ... ", i+1, len(pdfs), rel)
-		pages, sizeMB, err := convertOne(pdfPath, outPath, *dpi, *quality)
-		if err != nil {
-			fmt.Printf("失败: %v\n", err)
-			os.Remove(outPath)
-			failCount++
-			continue
-		}
-		fmt.Printf("完成  %d 页, %.1f MB -> %s\n", pages, sizeMB, filepath.Base(outPath))
-		okCount++
-	}
-	fmt.Println("--------------------------------------------------")
-	fmt.Printf("===== 汇总: 成功 %d, 失败 %d, 总耗时 %.1f 秒 =====\n", okCount, failCount, time.Since(t0).Seconds())
 	if failCount > 0 {
 		os.Exit(2)
 	}
