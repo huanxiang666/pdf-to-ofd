@@ -98,7 +98,14 @@ func renderPage(doc unsafe.Pointer, pageIdx int, dpi, quality int) ([]byte, floa
 	pxW := int(ptW*scale + 0.5)
 	pxH := int(ptH*scale + 0.5)
 
-	bmp := fnBmpCreateEx(int32(pxW), int32(pxH), fpdfBitmapBGRA, nil, 0)
+	// 透明背景的 PDF(如电子发票)未绘制像素会呈黑色/透明, 预填不透明白底
+	bg := make([]byte, pxW*pxH*4)
+	for i := 0; i < len(bg); i += 4 {
+		bg[i], bg[i+1], bg[i+2], bg[i+3] = 0xFF, 0xFF, 0xFF, 0xFF
+	}
+	defer runtime.KeepAlive(bg)
+
+	bmp := fnBmpCreateEx(int32(pxW), int32(pxH), fpdfBitmapBGRA, unsafe.Pointer(&bg[0]), int32(pxW*4))
 	if bmp == nil {
 		return nil, 0, 0, fmt.Errorf("位图创建失败")
 	}
@@ -308,6 +315,7 @@ type batchOpts struct {
 	quality   int
 	outDir    string
 	force     bool
+	preview   bool
 }
 
 // errInputCollision 表示输出路径将覆盖本批输入文件, 属于保护性拒绝而非程序错误。
@@ -560,6 +568,22 @@ func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (ok
 			extra = fmt.Sprintf(" (跳过 %d 个文字/矢量对象)", skipped)
 		}
 		logf("    完成  %d 页, %.1f MB -> %s%s", pages, sizeMB, t.out, extra)
+		if o.preview {
+			ofdSrc := t.src
+			if t.pdf {
+				ofdSrc = t.out // 刚生成的 OFD
+			}
+			pvp := strings.TrimSuffix(t.out, filepath.Ext(t.out)) + ".preview.jpg"
+			if pv, perr := ofdFirstPageImage(ofdSrc); perr == nil {
+				if werr := os.WriteFile(pvp, pv, 0o644); werr == nil {
+					logf("    预览: %s (打开肉眼验证转换结果)", pvp)
+				} else {
+					logf("    预览写入失败: %v", werr)
+				}
+			} else {
+				logf("    预览: %v", perr)
+			}
+		}
 		okCount++
 	}
 
@@ -588,6 +612,7 @@ func main() {
 		quality   = flag.Int("q", 85, "JPEG 质量 1-100 (默认85)")
 		outDir    = flag.String("o", "", "输出目录 (默认与源文件同目录)")
 		force     = flag.Bool("f", false, "覆盖已存在的输出文件")
+		preview   = flag.Bool("preview", true, "转换后生成第一页预览图 <同名>.preview.jpg 用于验证")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "pdf-to-ofd — PDF <-> 图片型 OFD 双向转换")
@@ -627,6 +652,7 @@ func main() {
 		quality:   *quality,
 		outDir:    *outDir,
 		force:     *force,
+		preview:   *preview,
 	}, func(format string, args ...interface{}) {
 		fmt.Printf(format+"\n", args...)
 	})

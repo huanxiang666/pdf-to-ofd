@@ -508,6 +508,97 @@ func buildPDF(pages []ofdPageData, dpi, quality int) ([]byte, error) {
 	return pd.bytes(), nil
 }
 
+// ======================= 预览验证: 提取 OFD 第一页图片 =======================
+
+// ofdFirstPageImage 取出 OFD 第一页的第一张图片, 用于转换结果肉眼验证。
+// JPEG 原样返回; 其他格式重编码为 JPEG(q90)。页内无图片(矢量型 OFD)时返回错误。
+func ofdFirstPageImage(ofdPath string) ([]byte, error) {
+	zr, err := zip.OpenReader(ofdPath)
+	if err != nil {
+		return nil, fmt.Errorf("无法打开 OFD: %v", err)
+	}
+	defer zr.Close()
+	files := map[string]*zip.File{}
+	for _, f := range zr.File {
+		files[f.Name] = f
+	}
+	readXML := func(name string, v interface{}) error {
+		f, ok := files[name]
+		if !ok {
+			return fmt.Errorf("包内缺少 %s", name)
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		data, err := io.ReadAll(rc)
+		if err != nil {
+			return err
+		}
+		return xml.Unmarshal(data, v)
+	}
+	var root xOfdRoot
+	if err := readXML("OFD.xml", &root); err != nil || len(root.DocRoots) == 0 {
+		return nil, fmt.Errorf("OFD.xml 缺少 DocRoot")
+	}
+	docPath := cleanZipPath(root.DocRoots[0])
+	docDir := path.Dir(docPath)
+	if docDir == "." {
+		docDir = ""
+	}
+	var doc xDocument
+	if err := readXML(docPath, &doc); err != nil || len(doc.Pages) == 0 {
+		return nil, fmt.Errorf("文档没有页面")
+	}
+	box := parseNums(doc.PhysicalBox)
+	if len(box) != 4 {
+		box = []float64{0, 0, 210, 297}
+	}
+	resMap := map[string]string{}
+	resPaths := doc.DocRes
+	if len(resPaths) == 0 {
+		resPaths = []string{"DocumentRes.xml"}
+	}
+	for _, rp := range resPaths {
+		rp = cleanZipPath(path.Join(docDir, rp))
+		if _, ok := files[rp]; !ok {
+			continue
+		}
+		var rs xRes
+		if err := readXML(rp, &rs); err != nil {
+			continue
+		}
+		base := path.Dir(rp)
+		if rs.BaseLoc != "" {
+			base = path.Join(base, cleanZipPath(rs.BaseLoc))
+		}
+		for _, m := range rs.Media {
+			resMap[m.ID] = cleanZipPath(path.Join(base, m.File))
+		}
+	}
+	pg, _, err := readOFDPage(files, readXML, docDir, doc.Pages[0].BaseLoc, box, resMap)
+	if err != nil {
+		return nil, err
+	}
+	if len(pg.images) == 0 {
+		return nil, fmt.Errorf("第一页没有图片(矢量/文字型 OFD 无法预览)")
+	}
+	data := pg.images[0].data
+	if len(data) >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
+		return data, nil
+	}
+	m, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	var jb bytes.Buffer
+	if err := jpeg.Encode(&jb, m, &jpeg.Options{Quality: 90}); err != nil {
+		return nil, err
+	}
+	return jb.Bytes(), nil
+}
+
 // ======================= 主入口: OFD -> PDF =======================
 
 func convertOFD2PDF(ofdPath, pdfPath string, dpi, quality int) (pages, skipped int, sizeMB float64, err error) {

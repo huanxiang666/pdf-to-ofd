@@ -90,7 +90,7 @@ func runGUI() {
 	var mw *walk.MainWindow
 	var dirLE, outLE *walk.LineEdit
 	var logTE *walk.TextEdit
-	var recCB, forceCB *walk.CheckBox
+	var recCB, forceCB, prevCB *walk.CheckBox
 	var dpiNE, qNE *walk.NumberEdit
 	var startBtn *walk.PushButton
 	var settings *walk.Composite
@@ -121,11 +121,13 @@ func runGUI() {
 			quality:   int(qNE.Value()),
 			outDir:    outLE.Text(),
 			force:     forceCB.Checked(),
+			preview:   prevCB.Checked(),
 		}
 		busy = true
 		settings.SetEnabled(false)
 		recCB.SetEnabled(false)
 		forceCB.SetEnabled(false)
+		prevCB.SetEnabled(false)
 		startBtn.SetEnabled(false)
 		logf("目录: %s%s", absDir, map[bool]string{true: " (递归)", false: ""}[o.recursive])
 		logf("参数: DPI=%d  JPEG质量=%d%s", o.dpi, o.quality,
@@ -138,6 +140,7 @@ func runGUI() {
 				settings.SetEnabled(true)
 				recCB.SetEnabled(true)
 				forceCB.SetEnabled(true)
+				prevCB.SetEnabled(true)
 				startBtn.SetEnabled(true)
 				if fail > 0 {
 					walk.MsgBox(mw, "完成(有失败)", fmt.Sprintf("成功 %d 个, 失败 %d 个\n详见日志", ok, fail), walk.MsgBoxIconWarning)
@@ -209,6 +212,7 @@ func runGUI() {
 				Children: []Widget{
 					CheckBox{AssignTo: &recCB, Text: "递归子目录"},
 					CheckBox{AssignTo: &forceCB, Text: "覆盖已存在的输出"},
+					CheckBox{AssignTo: &prevCB, Text: "生成预览图验证", Checked: true},
 					HSpacer{},
 					PushButton{AssignTo: &startBtn, Text: "开始转换", OnClicked: func() { start() }},
 					PushButton{Text: "清空日志", OnClicked: func() { logTE.SetText("") }},
