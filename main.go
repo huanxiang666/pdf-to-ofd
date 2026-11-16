@@ -569,11 +569,14 @@ func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (ok
 		}
 		logf("    完成  %d 页, %.1f MB -> %s%s", pages, sizeMB, t.out, extra)
 		if o.preview {
+			// 两个方向的预览图分别命名, 同名 PDF/OFD 并存时互不覆盖
 			ofdSrc := t.src
+			suffix := ".preview-pdf.jpg" // 验证 OFD->PDF: 生成 PDF 内嵌的图
 			if t.pdf {
 				ofdSrc = t.out // 刚生成的 OFD
+				suffix = ".preview-ofd.jpg"
 			}
-			pvp := strings.TrimSuffix(t.out, filepath.Ext(t.out)) + ".preview.jpg"
+			pvp := strings.TrimSuffix(t.out, filepath.Ext(t.out)) + suffix
 			if pv, perr := ofdFirstPageImage(ofdSrc); perr == nil {
 				if werr := os.WriteFile(pvp, pv, 0o644); werr == nil {
 					logf("    预览: %s (打开肉眼验证转换结果)", pvp)
@@ -612,7 +615,7 @@ func main() {
 		quality   = flag.Int("q", 85, "JPEG 质量 1-100 (默认85)")
 		outDir    = flag.String("o", "", "输出目录 (默认与源文件同目录)")
 		force     = flag.Bool("f", false, "覆盖已存在的输出文件")
-		preview   = flag.Bool("preview", true, "转换后生成第一页预览图 <同名>.preview.jpg 用于验证")
+		preview   = flag.Bool("preview", true, "转换后生成第一页预览图(.preview-ofd.jpg / .preview-pdf.jpg)用于验证")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "pdf-to-ofd — PDF <-> 图片型 OFD 双向转换")
