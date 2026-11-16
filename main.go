@@ -12,6 +12,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
@@ -309,6 +310,9 @@ type batchOpts struct {
 	force     bool
 }
 
+// errInputCollision 表示输出路径将覆盖本批输入文件, 属于保护性拒绝而非程序错误。
+var errInputCollision = errors.New("输出与输入冲突")
+
 // batchPathKey 解析已有祖先的符号链接，也适用于尚未创建的输出路径。
 func batchPathKey(path string) (string, error) {
 	path, err := filepath.Abs(path)
@@ -365,6 +369,7 @@ func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (ok
 		info               os.FileInfo
 		pdf                bool
 		err                error
+		skip               string // 保护性跳过原因(非错误)
 	}
 	var tasks []task
 	// 扫描不完整时不能保证输入集合完整，因此在任何写入之前终止整批。
@@ -425,7 +430,7 @@ func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (ok
 			return "", err
 		}
 		if src, exists := inputs[key]; exists {
-			return key, fmt.Errorf("输出与输入冲突，禁止覆盖: %s", src)
+			return key, fmt.Errorf("%w，禁止覆盖: %s", errInputCollision, src)
 		}
 		info, err := os.Stat(out)
 		if err != nil && !os.IsNotExist(err) {
@@ -434,7 +439,7 @@ func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (ok
 		if err == nil {
 			for _, t := range tasks {
 				if os.SameFile(info, t.info) {
-					return key, fmt.Errorf("输出与输入冲突，禁止覆盖: %s", t.src)
+					return key, fmt.Errorf("%w，禁止覆盖: %s", errInputCollision, t.src)
 				}
 			}
 		}
@@ -453,26 +458,36 @@ func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (ok
 		}
 		t.out = strings.TrimSuffix(base, filepath.Ext(base)) + ext
 		key, err := checkOutput(t.out)
-		t.err = err
-		if key == "" {
-			continue
-		}
-		if j, exists := outputs[key]; exists {
-			conflict := fmt.Errorf("多个输入指向同一输出: %s", t.out)
-			t.err, tasks[j].err = conflict, conflict
-		} else {
-			outputs[key] = i
+		switch {
+		case errors.Is(err, errInputCollision) && o.outDir == "":
+			// 同名 PDF/OFD 同在输入目录且未指定输出目录: 两个方向都会覆盖对方源文件, 保护性跳过
+			t.skip = "同名 PDF/OFD 同在输入目录, 转换将覆盖源文件, 已保护; 请指定独立输出目录(-o 或 GUI「输出到」)"
+		case err != nil:
+			t.err = err
+		default:
+			if j, exists := outputs[key]; exists {
+				conflict := fmt.Errorf("多个输入指向同一输出: %s", t.out)
+				t.err, tasks[j].err = conflict, conflict
+			} else {
+				outputs[key] = i
+			}
 		}
 	}
 
 	var pdfiumAttempted, pdfiumLoaded bool
 	var pdfiumErr error
+	pairSkip, existingSkip := 0, 0
 	defer func() {
 		if pdfiumLoaded {
 			fnDestroyLib()
 		}
 	}()
 	for i, t := range tasks {
+		if t.skip != "" {
+			logf("[%d/%d] 跳过: %s: %s", i+1, len(tasks), t.rel, t.skip)
+			pairSkip++
+			continue
+		}
 		if t.err != nil {
 			logf("[%d/%d] 失败: %s: %v", i+1, len(tasks), t.rel, t.err)
 			failCount++
@@ -491,6 +506,7 @@ func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (ok
 		}
 		if err == nil && !o.force {
 			logf("[%d/%d] 跳过(已存在): %s", i+1, len(tasks), t.rel)
+			existingSkip++
 			okCount++
 			continue
 		}
@@ -549,6 +565,12 @@ func runBatch(absDir string, o batchOpts, logf func(string, ...interface{})) (ok
 
 	logf("--------------------------------------------------")
 	logf("===== 汇总: 成功 %d, 失败 %d, 总耗时 %.1f 秒 =====", okCount, failCount, time.Since(t0).Seconds())
+	if existingSkip > 0 {
+		logf("提示: %d 个因输出已存在而跳过; 需重新转换请勾选「覆盖已存在的输出」或加 -f", existingSkip)
+	}
+	if pairSkip > 0 {
+		logf("提示: %d 个因同名 PDF/OFD 同在输入目录而保护性跳过; 请指定独立输出目录(-o 或 GUI「输出到」)再转换", pairSkip)
+	}
 	return okCount, failCount
 }
 

@@ -14,9 +14,10 @@ func TestBatchProtectsInputPair(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_, failed := runBatch(dir, batchOpts{dpi: 150, quality: 85, force: true}, func(string, ...interface{}) {})
-	if failed != 2 {
-		t.Fatalf("conflicting inputs: failures=%d", failed)
+	// 同名 PDF/OFD 同在输入目录且未指定输出目录: 保护性跳过, 不算失败, 输入保持不变
+	ok, failed := runBatch(dir, batchOpts{dpi: 150, quality: 85, force: true}, func(string, ...interface{}) {})
+	if ok != 0 || failed != 0 {
+		t.Fatalf("pair without outDir: ok=%d failed=%d, want 0/0 (protective skip)", ok, failed)
 	}
 	for _, name := range []string{"same.pdf", "same.ofd"} {
 		data, err := os.ReadFile(filepath.Join(dir, name))
